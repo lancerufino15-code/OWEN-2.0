@@ -1,0 +1,2174 @@
+diff --git a/public/chat.js b/public/chat.js
+index 8a72f5f..bc83025 100644
+--- a/public/chat.js
++++ b/public/chat.js
+@@ -28,6 +28,13 @@ const metaTagsBox = document.getElementById("meta-tags-box");
+ const modelButtons = Array.from(document.querySelectorAll(".model-btn"));
+ const themeToggle = document.getElementById("theme-toggle");
+ const fullDocToggle = document.getElementById("full-doc-toggle");
++const librarySearchInput = document.getElementById("library-search");
++const librarySearchBtn = document.getElementById("library-search-btn");
++const libraryResults = document.getElementById("library-results");
++const libraryStatus = document.getElementById("library-status");
++const libraryIndexBtn = document.getElementById("library-index-btn");
++const libraryIngestBtn = document.getElementById("library-ingest-btn");
++const librarySelection = document.getElementById("library-selection");
+ 
+ const requiredNodes = [
+   fileInput,
+@@ -55,6 +62,13 @@ const requiredNodes = [
+   hashtagCloud,
+   metaTagsBox,
+   themeToggle,
++  librarySearchInput,
++  librarySearchBtn,
++  libraryResults,
++  libraryStatus,
++  libraryIndexBtn,
++  libraryIngestBtn,
++  librarySelection,
+   ...modelButtons,
+ ];
+ 
+@@ -94,6 +108,7 @@ let oneShotFile = null;
+ let oneShotPreviewUrl = "";
+ let activePdfSession = null;
+ let fullDocumentMode = true;
++let activeLibraryDoc = null;
+ const FOLLOWUP_REGEX = /\b(?:yes|no|yeah|yep|correct|right|exactly|that|those|them|it|same|still|more|continue|go on|as before|as above|what about|how about|clarify|elaborate|thanks|please do)\b/i;
+ const STOPWORDS = new Set([
+   "this", "that", "with", "from", "have", "will", "need", "more", "info", "what",
+@@ -1308,6 +1323,7 @@ function startNewConversation() {
+   conversation.length = 0;
+   activePdfSession = null;
+   clearOcrSession();
++  setLibrarySelection(null);
+   chatLog.innerHTML = "";
+   chatLog.dataset.empty = "true";
+   insightsLog.textContent = "No topics logged yet. Start chatting to see trends.";
+@@ -2857,6 +2873,296 @@ async function askFileWithFallback({ prompt, file, thinkingBubble }) {
+   return { answer, warning, continueRange: null };
+ }
+ 
++function setLibrarySelection(doc) {
++  if (!librarySelection) return;
++  activeLibraryDoc = doc;
++  if (!doc) {
++    librarySelection.dataset.state = "info";
++    librarySelection.innerHTML = "No lecture selected";
++    return;
++  }
++  const title = escapeHTML(doc.title || doc.key || doc.docId);
++  librarySelection.dataset.state = "info";
++  librarySelection.innerHTML = `
++    Using: <strong>${title}</strong>
++    <button type="button" class="link-btn" data-clear-library="true">Clear</button>
++  `;
++}
++
++function renderLibraryResults(records) {
++  if (!libraryResults) return;
++  libraryResults.innerHTML = "";
++  if (!records?.length) {
++    const empty = document.createElement("li");
++    empty.className = "library-empty";
++    empty.textContent = "No matching lectures yet.";
++    libraryResults.appendChild(empty);
++    return;
++  }
++  records.forEach((rec) => {
++    const li = document.createElement("li");
++    li.className = "library-result";
++    const statusClass = rec.status === "ready" ? "ready" : rec.status === "needs_browser_ocr" ? "warn" : "missing";
++    li.innerHTML = `
++      <div class="library-row-top">
++        <h4>${escapeHTML(rec.title || rec.key || rec.docId)}</h4>
++        <span class="status-tag ${statusClass}">${rec.status || "missing"}</span>
++      </div>
++      <div class="library-meta">${escapeHTML(rec.bucket || "")} · ${escapeHTML(rec.key || "")}</div>
++    `;
++    const actions = document.createElement("div");
++    actions.className = "library-actions-row";
++    if (rec.status === "ready") {
++      const useBtn = document.createElement("button");
++      useBtn.className = "chip-btn";
++      useBtn.type = "button";
++      useBtn.textContent = "Use cached lecture";
++      useBtn.addEventListener("click", async () => {
++        setLibrarySelection({ ...rec, status: "ready" });
++        setStatus(libraryStatus, "success", `Using cached lecture: ${rec.title}`);
++        if (chatInput.value.trim()) {
++          try {
++            await askLibraryDocQuestion({ ...rec, status: "ready" }, chatInput.value.trim());
++          } catch {
++            // handled upstream
++          }
++        }
++      });
++      actions.appendChild(useBtn);
++    }
++    const ingestBtn = document.createElement("button");
++    ingestBtn.className = "chip-btn";
++    ingestBtn.type = "button";
++    ingestBtn.textContent = rec.status === "ready" ? "Reprocess" : rec.status === "needs_browser_ocr" ? "Finish OCR once" : "Process once";
++    ingestBtn.addEventListener("click", () => triggerLibraryIngest(rec));
++    actions.appendChild(ingestBtn);
++    li.appendChild(actions);
++    libraryResults.appendChild(li);
++  });
++}
++
++async function runLibrarySearch() {
++  const query = librarySearchInput?.value?.trim() || "";
++  setStatus(libraryStatus, "pending", query ? `Searching "${query}"…` : "Loading library index…");
++  try {
++    const resp = await fetch(`/api/library/search?q=${encodeURIComponent(query)}&limit=12`);
++    const payload = await resp.json().catch(() => ({}));
++    if (!resp.ok) {
++      throw new Error(payload?.error || payload?.details || "Library search failed.");
++    }
++    const results = Array.isArray(payload?.results) ? payload.results : [];
++    renderLibraryResults(results);
++    setStatus(
++      libraryStatus,
++      results.length ? "success" : "info",
++      results.length ? `Found ${results.length} match${results.length === 1 ? "" : "es"}.` : "No matches yet. Try another keyword or refresh index.",
++    );
++  } catch (error) {
++    console.error(error);
++    setStatus(libraryStatus, "error", error instanceof Error ? error.message : "Library search failed.");
++  }
++}
++
++async function askLibraryDocQuestion(doc, prompt) {
++  const question = prompt.trim();
++  if (!question) {
++    chatInput.focus();
++    setStatus(libraryStatus, "info", "Type a question for this lecture.");
++    return;
++  }
++  const userBubble = appendChatMessage("user", question);
++  renderMathIfReady(userBubble);
++  const thinking = showThinkingBubble();
++  try {
++    const resp = await fetch("/api/library/ask", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ docId: doc.docId, question }),
++    });
++    const payload = await resp.json().catch(() => ({}));
++    if (!resp.ok) {
++      const msg = payload?.error || payload?.details || "Library Q&A failed.";
++      throw new Error(msg);
++    }
++    if (thinking && thinking.isConnected) thinking.remove();
++    const answer = payload?.answer || "(no answer returned)";
++    const citations = Array.isArray(payload?.sources)
++      ? payload.sources
++        .map(src => {
++          const idx = typeof src?.chunkId === "number" ? `C${src.chunkId + 1}` : "C";
++          const snippet = typeof src?.snippet === "string" ? src.snippet.slice(0, 160) : "";
++          return snippet ? `${idx}: ${snippet}` : idx;
++        })
++        .filter(Boolean)
++      : [];
++    const fullAnswer = citations.length ? `${answer}\n\nSources:\n- ${citations.join("\n- ")}` : answer;
++    const assistant = appendChatMessage("assistant", fullAnswer, { model: "library" });
++    renderMathIfReady(assistant);
++    setStatus(libraryStatus, "success", `Answered using ${doc.title || doc.docId}.`);
++    setLibrarySelection({ ...doc, status: "ready" });
++    chatInput.value = "";
++    return payload;
++  } catch (error) {
++    console.error(error);
++    if (thinking && thinking.isConnected) thinking.remove();
++    const bubble = appendChatMessage("assistant", error instanceof Error ? error.message : "Unable to answer from library.", { track: false });
++    bubble.classList.add("error");
++    setStatus(libraryStatus, "error", error instanceof Error ? error.message : "Library Q&A failed.");
++    throw error;
++  }
++}
++
++async function runLibraryBrowserOcr({ docId, bucket, key, downloadUrl, title, pageCount }) {
++  const label = title || key || docId;
++  setStatus(libraryStatus, "pending", "Downloading PDF for OCR…");
++  const url = downloadUrl || `/api/file?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;
++  const res = await fetch(url);
++  if (!res.ok) {
++    const msg = await res.text().catch(() => "");
++    throw new Error(msg || "Could not download PDF for OCR.");
++  }
++  const blob = await res.blob();
++  const arrayBuffer = await blob.arrayBuffer();
++  const pdfjsLib = await loadPdfJsLib();
++  const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
++  const totalPages = pageCount || pdfDoc?.numPages || 0;
++  if (!totalPages) {
++    throw new Error("PDF contains no pages to OCR.");
++  }
++  const maxPages = fullDocumentMode ? totalPages : Math.min(OCR_PAGE_LIMIT, totalPages);
++  const pageNumbers = Array.from({ length: maxPages }, (_, i) => i + 1);
++  const pending = [];
++  let processed = 0;
++  let lastFinalize = null;
++
++  await promisePool(pageNumbers, OCR_CONCURRENCY, async (pageNumber) => {
++    const render = await renderPdfPageToBlob(pdfjsLib, pdfDoc, pageNumber);
++    const pageResult = await ocrPageImage({
++      fileHash: docId,
++      pageIndex: pageNumber - 1,
++      blob: render.blob,
++      filename: `${label}-p${pageNumber}.jpg`,
++    });
++    pending.push(pageResult);
++    processed += 1;
++    if (pending.length >= OCR_SAVE_BATCH) {
++      lastFinalize = await finalizeOcrText({
++        fileHash: docId,
++        pages: [...pending],
++        filename: label,
++        totalPages,
++      });
++      pending.length = 0;
++    }
++    setStatus(libraryStatus, "pending", `OCR ${processed}/${pageNumbers.length} pages…`);
++  });
++
++  if (pending.length) {
++    lastFinalize = await finalizeOcrText({
++      fileHash: docId,
++      pages: pending,
++      filename: label,
++      totalPages,
++    });
++  }
++
++  setStatus(libraryStatus, "success", `OCR cached for ${label}.`);
++  const readyDoc = { docId, bucket, key, title: label, status: "ready", extractedKey: lastFinalize?.extractedKey };
++  setLibrarySelection(readyDoc);
++  return readyDoc;
++}
++
++async function triggerLibraryIngest(record) {
++  if (!record) return;
++  setStatus(libraryStatus, "pending", "Processing in Worker…");
++  try {
++    const resp = await fetch("/api/library/ingest", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ bucket: record.bucket, key: record.key }),
++    });
++    const payload = await resp.json().catch(() => ({}));
++    if (!resp.ok) {
++      const msg = payload?.error || payload?.details || "Library ingest failed.";
++      throw new Error(msg);
++    }
++    if (payload.status === "needs_browser_ocr") {
++      const readyDoc = await runLibraryBrowserOcr({
++        docId: payload.docId || record.docId,
++        bucket: payload.bucket || record.bucket,
++        key: payload.key || record.key,
++        downloadUrl: payload.downloadUrl,
++        title: record.title,
++        pageCount: payload.pageCount,
++      });
++      await runLibrarySearch();
++      return readyDoc;
++    }
++    const readyDoc = {
++      docId: payload.docId || record.docId,
++      title: record.title,
++      bucket: record.bucket,
++      key: record.key,
++      status: "ready",
++      extractedKey: payload.extractedKey || record.extractedKey,
++    };
++    setLibrarySelection(readyDoc);
++    setStatus(libraryStatus, "success", "Cached text ready.");
++    await runLibrarySearch();
++    if (chatInput.value.trim()) {
++      await askLibraryDocQuestion(readyDoc, chatInput.value.trim());
++    }
++    return readyDoc;
++  } catch (error) {
++    console.error(error);
++    setStatus(libraryStatus, "error", error instanceof Error ? error.message : "Library ingest failed.");
++    throw error;
++  }
++}
++
++async function runLibraryBatchIndex() {
++  setStatus(libraryStatus, "pending", "Rebuilding library index…");
++  try {
++    const resp = await fetch("/api/library/batch-index", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
++    const payload = await resp.json().catch(() => ({}));
++    if (!resp.ok) {
++      const msg = payload?.error || payload?.details || "Batch index failed.";
++      throw new Error(msg);
++    }
++    setStatus(libraryStatus, "success", `Indexed ${payload?.indexed ?? 0} PDFs.`);
++    await runLibrarySearch();
++  } catch (error) {
++    console.error(error);
++    setStatus(libraryStatus, "error", error instanceof Error ? error.message : "Batch index failed.");
++  }
++}
++
++async function runLibraryBatchIngest(mode = "embedded_only") {
++  setStatus(libraryStatus, "pending", mode === "full" ? "Batch ingest (full)..." : "Batch ingest (embedded only)...");
++  try {
++    const resp = await fetch("/api/library/batch-ingest", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ mode }),
++    });
++    const payload = await resp.json().catch(() => ({}));
++    if (!resp.ok) {
++      const msg = payload?.error || payload?.details || "Batch ingest failed.";
++      throw new Error(msg);
++    }
++    const queued = payload?.queued ? `Queued ${payload.queued} scanned PDFs.` : "";
++    setStatus(
++      libraryStatus,
++      "success",
++      `Processed ${payload?.processed ?? 0} docs. Ready: ${payload?.ready ?? 0}. Skipped: ${payload?.skipped ?? 0}. ${queued}`.trim(),
++    );
++    await runLibrarySearch();
++  } catch (error) {
++    console.error(error);
++    setStatus(libraryStatus, "error", error instanceof Error ? error.message : "Batch ingest failed.");
++  }
++}
++
+ function handleLocalCommands(prompt) {
+   const match = prompt.match(/^\/file\s+(\S+)(?:\s+(\S+))?/i);
+   if (match) {
+@@ -2928,6 +3234,15 @@ function handleChatPaste(event) {
+ 
+ async function runChat(prompt) {
+   if (handleLocalCommands(prompt)) return;
++  if (activeLibraryDoc && attachments.length === 0 && !oneShotFile) {
++    try {
++      await askLibraryDocQuestion(activeLibraryDoc, prompt);
++    } finally {
++      chatStreaming = false;
++      chatSend.disabled = false;
++    }
++    return;
++  }
+   if (chatStreaming) return;
+   chatStreaming = true;
+   chatSend.disabled = true;
+@@ -3156,6 +3471,26 @@ retrieveBtn.addEventListener("click", async () => {
+   await retrieveFileFromR2({ key, bucket, autoDownload: true, statusEl: retrieveStatus, emitChat: true });
+ });
+ 
++librarySearchBtn.addEventListener("click", runLibrarySearch);
++librarySearchInput.addEventListener("keydown", (event) => {
++  if (event.key === "Enter") {
++    event.preventDefault();
++    runLibrarySearch();
++  }
++});
++libraryIndexBtn.addEventListener("click", runLibraryBatchIndex);
++libraryIngestBtn.addEventListener("click", (event) => {
++  const mode = event.shiftKey || event.metaKey ? "full" : "embedded_only";
++  runLibraryBatchIngest(mode);
++});
++librarySelection.addEventListener("click", (event) => {
++  const target = event.target;
++  if (target && target.dataset?.clearLibrary === "true") {
++    setLibrarySelection(null);
++    setStatus(libraryStatus, "info", "Cleared library selection.");
++  }
++});
++
+ window.addEventListener("keydown", (event) => {
+   if (event.key === "Escape") {
+     clearConversation();
+@@ -3197,3 +3532,5 @@ if (lastSavedId && storedConversations.some(conv => conv.id === lastSavedId)) {
+ }
+ newConvoBtn.addEventListener("click", () => startNewConversation());
+ syncMetaTagsFromKV(activeConversationId);
++setLibrarySelection(null);
++runLibrarySearch().catch(() => {});
+diff --git a/public/index.html b/public/index.html
+index d6aedd8..dee5b5e 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -282,6 +282,124 @@ body.theme-light .bubble.thinking {
+         color: #bfdbfe;
+       }
+ 
++      .ghost-btn,
++      .chip-btn {
++        border: 1px solid var(--border);
++        background: var(--panel-dark);
++        color: var(--text);
++        padding: 10px 12px;
++        border-radius: 12px;
++        cursor: pointer;
++        font-weight: 600;
++        transition: border-color 0.2s ease, transform 0.15s ease;
++      }
++
++      .ghost-btn:hover,
++      .chip-btn:hover {
++        border-color: rgba(176, 38, 255, 0.5);
++        transform: translateY(-1px);
++      }
++
++      .library-card .library-controls {
++        display: flex;
++        gap: 10px;
++        align-items: center;
++        margin-top: 10px;
++      }
++
++      .library-card .library-actions {
++        display: flex;
++        gap: 8px;
++        flex-wrap: wrap;
++        margin: 8px 0;
++      }
++
++      .library-results {
++        list-style: none;
++        padding: 0;
++        margin: 10px 0 0 0;
++        display: flex;
++        flex-direction: column;
++        gap: 10px;
++        max-height: 260px;
++        overflow: auto;
++      }
++
++      .library-result {
++        border: 1px solid var(--border);
++        background: var(--panel-dark);
++        border-radius: 14px;
++        padding: 10px 12px;
++      }
++
++      .library-row-top {
++        display: flex;
++        align-items: center;
++        justify-content: space-between;
++        gap: 10px;
++      }
++
++      .library-result h4 {
++        margin: 0;
++        font-size: 1rem;
++      }
++
++      .status-tag {
++        display: inline-flex;
++        align-items: center;
++        gap: 6px;
++        padding: 4px 8px;
++        border-radius: 10px;
++        font-size: 0.8rem;
++        letter-spacing: 0.04em;
++        text-transform: uppercase;
++        border: 1px solid var(--border);
++      }
++
++      .status-tag.ready {
++        color: #10b981;
++        border-color: rgba(16, 185, 129, 0.45);
++      }
++
++      .status-tag.warn {
++        color: #f97316;
++        border-color: rgba(249, 115, 22, 0.5);
++      }
++
++      .status-tag.missing {
++        color: #f59e0b;
++        border-color: rgba(245, 158, 11, 0.45);
++      }
++
++      .library-meta {
++        margin-top: 4px;
++        font-size: 0.9rem;
++        color: var(--muted);
++        word-break: break-word;
++      }
++
++      .library-actions-row {
++        display: flex;
++        flex-wrap: wrap;
++        gap: 8px;
++        margin-top: 8px;
++      }
++
++      .library-empty {
++        color: var(--muted);
++        font-style: italic;
++      }
++
++      .link-btn {
++        background: none;
++        border: none;
++        color: inherit;
++        text-decoration: underline;
++        cursor: pointer;
++        padding: 0;
++        font: inherit;
++      }
++
+       .advanced-control {
+         margin-top: 10px;
+         font-size: 0.8rem;
+@@ -1503,6 +1621,21 @@ body.theme-light .bubble.thinking {
+           <div id="upload-status" class="status-pill" role="status" aria-live="polite"></div>
+         </section>
+ 
++        <section class="panel library-card">
++          <div class="section-title" style="margin-bottom:6px;">Library</div>
++          <div class="library-controls">
++            <input id="library-search" type="text" placeholder="Search lecture titles or filenames…" />
++            <button id="library-search-btn" type="button" class="ghost-btn">Search Library</button>
++          </div>
++          <div class="library-actions">
++            <button id="library-index-btn" type="button" class="chip-btn" title="Rebuild cross-bucket index">Refresh index</button>
++            <button id="library-ingest-btn" type="button" class="chip-btn" title="Shift-click for full ingest + queue scanned PDFs">Batch ingest</button>
++          </div>
++          <div id="library-selection" class="status-pill" data-state="info">No lecture selected</div>
++          <ul id="library-results" class="library-results"></ul>
++          <div id="library-status" class="status-pill" aria-live="polite"></div>
++        </section>
++
+         <section class="panel retrieve-card">
+           <h3 style="margin:0 0 6px 0">Retrieve a stored file</h3>
+           <p class="helper" style="color:var(--muted);font-size:0.85rem;margin:0 0 10px 0;">
+diff --git a/src/index.ts b/src/index.ts
+index 09b19e7..542cab3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,6 +2,31 @@ import { AGENTS } from "./agents";
+ import type { OwenAgent } from "./agents";
+ import { Env } from "./types";
+ import * as pdfjs from "./pdfjs-dist-legacy-build-pdf";
++import { normalizePages, normalizePlainText, type PageText } from "./pdf/normalize";
++import {
++  buildExtractedKeyForHash,
++  loadCachedExtraction,
++  readManifest,
++  writeManifest,
++  type PdfManifest,
++} from "./pdf/cache";
++import { chunkText, rankChunks } from "./pdf/retrieval";
++import {
++  LIBRARY_INDEX_KEY,
++  LIBRARY_QUEUE_PREFIX,
++  buildExtractedPath,
++  buildIndexKeyForDoc,
++  buildManifestPath,
++  computeDocId,
++  isPdfKey,
++  type LibraryIndexRecord,
++  normalizePreview,
++  readIndex as readLibraryIndex,
++  scoreRecords as scoreLibraryRecords,
++  titleFromKey,
++  tokensFromTitle,
++  writeIndex as writeLibraryIndex,
++} from "./library";
+ 
+ // Cloudflare Workers cannot spawn PDF.js workers; force single-threaded parsing.
+ if (pdfjs?.GlobalWorkerOptions) {
+@@ -146,6 +171,8 @@ const BUCKET_BINDINGS = {
+ } as const;
+ 
+ const DEFAULT_BUCKET = "owen-uploads" as const;
++const EXTRACTION_BUCKET = "owen-ingest" as const;
++const LIBRARY_BUCKET = "owen-ingest" as const;
+ const enc = new TextEncoder();
+ const VECTOR_POLL_INTERVAL_MS = 1500;
+ const VECTOR_POLL_TIMEOUT_MS = 45_000;
+@@ -155,11 +182,22 @@ const FILE_CONTEXT_CHAR_LIMIT = 60_000;
+ const MAX_OCR_TEXT_LENGTH = 900_000;
+ const MAX_STORED_TEXT_LENGTH = 900_000;
+ const DEFAULT_MAX_OCR_PAGES = 200;
++const CLIENT_OCR_PAGE_CAP = 15;
++const MIN_EMBEDDED_PDF_CHARS = 800;
++const PDF_SAMPLE_PAGE_TARGET = 5;
+ const ONE_SHOT_PREVIEW_LIMIT = 1200;
+ const MAX_EXTRACT_CHARS = 120_000;
+ const MAX_EXTRACT_PAGES = 200;
+-const OCR_MAX_OUTPUT_TOKENS = 4000;
++const OCR_MAX_OUTPUT_TOKENS = 1800;
++const OCR_PAGE_OUTPUT_TOKENS = 1200;
++const RETRIEVAL_CHUNK_SIZE = 2200;
++const RETRIEVAL_CHUNK_OVERLAP = 200;
++const RETRIEVAL_TOP_K = 6;
+ const RETRY_DELAYS_MS = [0, 500, 1500];
++const DEFAULT_OCR_MAX_PAGES = 15;
++const LIBRARY_SEARCH_LIMIT = 12;
++const LIBRARY_BATCH_PAGE_LIMIT = 5;
++const LIBRARY_QUEUE_MAX = 200;
+ 
+ type DocSummary = {
+   file_id?: string;
+@@ -284,6 +322,30 @@ export default {
+         });
+       }
+ 
++      if (url.pathname === "/api/library/search" && req.method === "GET") {
++        return handleLibrarySearch(req, env);
++      }
++
++      if (url.pathname === "/api/library/ingest" && req.method === "POST") {
++        return handleLibraryIngest(req, env);
++      }
++
++      if (url.pathname === "/api/library/ask" && req.method === "POST") {
++        return handleLibraryAsk(req, env);
++      }
++
++      if (url.pathname === "/api/library/batch-index" && req.method === "POST") {
++        return handleLibraryBatchIndex(req, env);
++      }
++
++      if (url.pathname === "/api/library/batch-ingest" && req.method === "POST") {
++        return handleLibraryBatchIngest(req, env);
++      }
++
++      if (url.pathname === "/api/r2/signed-url" && req.method === "GET") {
++        return handleSignedUrl(req, env);
++      }
++
+       if (url.pathname === "/api/upload" && req.method === "POST") {
+         return handleUpload(req, env);
+       }
+@@ -292,10 +354,26 @@ export default {
+         return handleChat(req, env);
+       }
+ 
++      if (url.pathname === "/api/pdf-ingest" && req.method === "POST") {
++        return handlePdfIngest(req, env);
++      }
++
+       if (url.pathname === "/api/ask-file" && req.method === "POST") {
+         return handleAskFile(req, env);
+       }
+ 
++      if (url.pathname === "/api/ask-doc" && req.method === "POST") {
++        return handleAskDoc(req, env);
++      }
++
++      if (url.pathname === "/api/ocr-page" && req.method === "POST") {
++        return handleOcrPage(req, env);
++      }
++
++      if (url.pathname === "/api/ocr-finalize" && req.method === "POST") {
++        return handleOcrFinalize(req, env);
++      }
++
+       if (url.pathname === "/api/generate-file" && req.method === "POST") {
+         return handleGenerateFile(req, env);
+       }
+@@ -1478,7 +1556,8 @@ async function handleUpload(req: Request, env: Env): Promise<Response> {
+ async function uploadBytesToOpenAI(env: Env, bytes: Uint8Array, filename: string, purpose: string): Promise<string | null> {
+   const form = new FormData();
+   form.append("purpose", purpose);
+-  form.append("file", new File([bytes], filename, { type: "application/octet-stream" }));
++  const blobPart: BlobPart = bytes as unknown as BlobPart;
++  form.append("file", new File([blobPart], filename, { type: "application/octet-stream" }));
+   const base = env.OPENAI_API_BASE?.replace(/\/$/, "") || "https://api.openai.com/v1";
+   const resp = await fetch(`${base}/files`, {
+     method: "POST",
+@@ -1494,6 +1573,70 @@ async function uploadBytesToOpenAI(env: Env, bytes: Uint8Array, filename: string
+   return uploadedId || null;
+ }
+ 
++function generateFileId(seed?: string) {
++  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
++    return crypto.randomUUID();
++  }
++  const suffix = Math.random().toString(16).slice(2, 10);
++  const prefix = seed && seed.trim() ? seed.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) : "file";
++  return `${prefix}-${Date.now().toString(36)}-${suffix}`;
++}
++
++function buildExtractedKey(fileId: string) {
++  const base = sanitizeKey(fileId || "file", `file-${Date.now()}`);
++  return `extracted/${base}.txt`;
++}
++
++function getExtractionBucket(env: Env) {
++  const lookup =
++    lookupBucket(env, EXTRACTION_BUCKET) ||
++    lookupBucket(env, BUCKET_BINDINGS[EXTRACTION_BUCKET as keyof typeof BUCKET_BINDINGS]) ||
++    lookupBucket(env, DEFAULT_BUCKET) ||
++    lookupBucket(env, BUCKET_BINDINGS[DEFAULT_BUCKET as keyof typeof BUCKET_BINDINGS]);
++  if (!lookup) {
++    throw new Error("No extraction bucket configured.");
++  }
++  return lookup;
++}
++
++function getLibraryBucket(env: Env) {
++  const lookup =
++    lookupBucket(env, LIBRARY_BUCKET) ||
++    lookupBucket(env, BUCKET_BINDINGS[LIBRARY_BUCKET as keyof typeof BUCKET_BINDINGS]) ||
++    getExtractionBucket(env);
++  if (!lookup) {
++    throw new Error("No library bucket configured.");
++  }
++  return lookup;
++}
++
++async function persistExtractedText(env: Env, fileId: string, text: string) {
++  const normalized = normalizeExtractedText(text).slice(0, MAX_OCR_TEXT_LENGTH);
++  const { bucket, name } = getExtractionBucket(env);
++  const extractedKey = buildExtractedKey(fileId);
++  await bucket.put(extractedKey, normalized, {
++    httpMetadata: { contentType: "text/plain; charset=utf-8" },
++  });
++  return { extractedKey, bucket: name, preview: normalized.slice(0, ONE_SHOT_PREVIEW_LIMIT) };
++}
++
++async function loadExtractedText(env: Env, { fileId, extractedKey }: { fileId?: string; extractedKey?: string; }) {
++  const key = extractedKey?.trim() || (fileId ? buildExtractedKey(fileId) : "");
++  if (!key) return null;
++  try {
++    const { bucket } = getExtractionBucket(env);
++    const object = await bucket.get(key);
++    if (!object || !object.body) return null;
++    const text = await object.text();
++    const normalized = normalizeExtractedText(text);
++    if (!normalized) return null;
++    return { text: normalized.slice(0, MAX_OCR_TEXT_LENGTH), key };
++  } catch (err) {
++    console.warn("[ASK-FILE] Failed to load extracted text", { key, error: err instanceof Error ? err.message : String(err) });
++    return null;
++  }
++}
++
+ async function extractPdfForAsk(env: Env, fileId: string, filename: string): Promise<string> {
+   const prompt = [
+     `You are a document ingestion (text extraction + OCR) service helping OWEN answer questions.`,
+@@ -1540,8 +1683,149 @@ async function extractPdfForAsk(env: Env, fileId: string, filename: string): Pro
+   return extractOutputText(data).trim().slice(0, MAX_EXTRACT_CHARS);
+ }
+ 
++async function handlePdfIngest(req: Request, env: Env): Promise<Response> {
++  const contentType = req.headers.get("content-type") || "";
++  if (!contentType.includes("multipart/form-data")) {
++    return json({ error: "Send multipart/form-data with fields: file, fileHash." }, 400);
++  }
++  const form = await req.formData();
++  const file = form.get("file");
++  const fileHash = typeof form.get("fileHash") === "string" ? (form.get("fileHash") as string).trim() : "";
++  const requestedMaxPages = Number(form.get("maxPages"));
++  const maxPages = Number.isFinite(requestedMaxPages) && requestedMaxPages > 0 ? Math.min(requestedMaxPages, DEFAULT_OCR_MAX_PAGES) : DEFAULT_OCR_MAX_PAGES;
++
++  if (!(file instanceof File)) return json({ error: "Missing file upload." }, 400);
++  if (!fileHash) return json({ error: "Missing fileHash." }, 400);
++  const filename = sanitizeFilename(file.name || "upload.pdf");
++  const mimeType = file.type || "application/pdf";
++  if (!isLikelyPdfFilename(filename) && !isPdfMimeType(mimeType)) {
++    return json({ error: "Only PDF ingestion is supported here." }, 400);
++  }
++
++  const { bucket } = getExtractionBucket(env);
++  const cache = await loadCachedExtraction(bucket, fileHash);
++  if (cache.text) {
++    console.log("[PDF-INGEST] cache hit", { fileHash, method: cache.manifest?.method || "cache" });
++    return json({
++      extractionStatus: "ok",
++      method: "cache",
++      extractedKey: cache.extractedKey,
++      preview: cache.text.slice(0, ONE_SHOT_PREVIEW_LIMIT),
++      pageCount: cache.manifest?.pageCount,
++      manifest: cache.manifest,
++    });
++  }
++  if (cache.manifest && !cache.text) {
++    console.log("[PDF-INGEST] cached manifest without text, requiring OCR", {
++      fileHash,
++      pageCount: cache.manifest.pageCount,
++    });
++    return json({
++      extractionStatus: "needs_ocr_images",
++      method: "ocr",
++      fileHash,
++      extractedKey: cache.extractedKey,
++      pageCount: cache.manifest.pageCount,
++      maxPages,
++      manifest: cache.manifest,
++    });
++  }
++
++  const bytes = new Uint8Array(await file.arrayBuffer());
++  const extraction = await extractEmbeddedPagesFromPdf(bytes, { sampleCount: PDF_SAMPLE_PAGE_TARGET, maxPages: MAX_EXTRACT_PAGES, allowEarlyStop: true });
++  if (extraction.scanned || !extraction.pages.length) {
++    const manifest: PdfManifest = {
++      fileHash,
++      filename,
++      method: "ocr",
++      pagesProcessed: 0,
++      pageCount: extraction.pageCount,
++      createdAt: new Date().toISOString(),
++    };
++    await writeManifest(bucket, manifest);
++    console.log("[PDF-INGEST] scanned PDF detected, browser OCR required", {
++      fileHash,
++      pageCount: extraction.pageCount,
++      sampledPagesWithText: extraction.sampledPagesWithText,
++    });
++    return json({
++      extractionStatus: "needs_ocr_images",
++      method: "ocr",
++      fileHash,
++      extractedKey: cache.extractedKey,
++      pageCount: extraction.pageCount,
++      maxPages,
++      manifest,
++    });
++  }
++
++  const normalized = normalizePages(extraction.pages);
++  const finalText = normalized.text.slice(0, MAX_OCR_TEXT_LENGTH);
++  const preview = finalText.slice(0, ONE_SHOT_PREVIEW_LIMIT);
++  await bucket.put(cache.extractedKey, finalText, {
++    httpMetadata: { contentType: "text/plain; charset=utf-8" },
++  });
++  const manifest: PdfManifest = {
++    fileHash,
++    filename,
++    method: "embedded",
++    pagesProcessed: normalized.pagesProcessed,
++    pageCount: extraction.pageCount,
++    createdAt: new Date().toISOString(),
++    preview,
++  };
++  await writeManifest(bucket, manifest);
++  console.log("[PDF-INGEST] embedded text stored", {
++    fileHash,
++    method: "embedded",
++    length: finalText.length,
++    pageCount: extraction.pageCount,
++  });
++
++  return json({
++    extractionStatus: "ok",
++    method: "embedded",
++    extractedKey: cache.extractedKey,
++    preview,
++    pageCount: extraction.pageCount,
++    manifest,
++  });
++}
++
+ async function handleAskFile(req: Request, env: Env): Promise<Response> {
+   const contentType = req.headers.get("content-type") || "";
++  if (contentType.includes("application/json")) {
++    const body = await req.json().catch(() => null);
++    if (!body || typeof body !== "object" || Array.isArray(body)) {
++      return json({ error: "Send JSON { fileId, message, extractedKey? }." }, 400);
++    }
++    const message = typeof (body as any).message === "string" ? (body as any).message.trim() : "";
++    const fileId = typeof (body as any).fileId === "string" ? (body as any).fileId.trim() : "";
++    const extractedKey = typeof (body as any).extractedKey === "string" ? (body as any).extractedKey.trim() : "";
++    if (!message) return json({ error: "Missing 'message'." }, 400);
++    if (!fileId && !extractedKey) return json({ error: "Missing fileId or extractedKey." }, 400);
++
++    const loaded = await loadExtractedText(env, { fileId, extractedKey });
++    if (!loaded) {
++      return json({ error: "extracted_text_not_found", details: "Extraction not ready or missing for this fileId." }, 404);
++    }
++    const preview = loaded.text.slice(0, ONE_SHOT_PREVIEW_LIMIT);
++    try {
++      const answer = await answerWithContext(env, loaded.text, message);
++      return json({
++        answer,
++        extractionStatus: "ok",
++        method: "stored",
++        extractedKey: loaded.key,
++        extractedTextPreview: preview,
++      });
++    } catch (err) {
++      const msg = err instanceof Error ? err.message : String(err);
++      console.error("[ASK-FILE] Answering from stored text failed", err);
++      return json({ error: "answer_failed", details: msg }, 502);
++    }
++  }
++
+   if (!contentType.includes("multipart/form-data")) {
+     return json({ error: "Send multipart/form-data with fields: message, file" }, 400);
+   }
+@@ -1555,28 +1839,56 @@ async function handleAskFile(req: Request, env: Env): Promise<Response> {
+   const mimeType = file.type || "application/octet-stream";
+   const bytes = new Uint8Array(await file.arrayBuffer());
+   const startTime = Date.now();
+-  console.log("[ASK-FILE] start", { filename, mimeType, size: bytes.length });
++  const fileId = generateFileId(filename);
++  console.log("[ASK-FILE] start", { filename, mimeType, size: bytes.length, fileId });
++
++  const isPdf = isLikelyPdfFilename(filename) || isPdfMimeType(mimeType);
++  const isImage = isLikelyImageFilename(filename) || isImageMimeType(mimeType);
+ 
+   let extracted = "";
+-  let extractionStatus: "ready" | "empty" | "error" = "empty";
+-  let extractionError: string | undefined;
++  let extractionStatus: "ok" | "needs_ocr_images" | "error" = "ok";
++  let method: "embedded" | "ocr" | "original" = "embedded";
+ 
+-  try {
+-    const isPdf = isLikelyPdfFilename(filename) || isPdfMimeType(mimeType);
+-    const isImage = isLikelyImageFilename(filename) || isImageMimeType(mimeType);
+-
+-    if (isPdf) {
+-      const fileId = await uploadBytesToOpenAI(env, bytes, filename, "assistants");
+-      if (!fileId) throw new Error("Unable to upload PDF to OpenAI Files.");
+-      console.log("[ASK-FILE] uploaded to OpenAI", { file_id: fileId });
+-      extracted = await extractPdfForAsk(env, fileId, filename);
+-    } else {
++  if (isPdf) {
++    try {
++      let embedded = "";
++      if (PDFJS_AVAILABLE) {
++        embedded = await extractEmbeddedTextFromPdf(bytes);
++      } else {
++        console.log("[ASK-FILE] PDF.js unavailable in Worker; skipping embedded text path.");
++      }
++      embedded = normalizeExtractedText(embedded);
++      if (embedded && embedded.length >= MIN_EMBEDDED_PDF_CHARS) {
++        extracted = embedded.slice(0, MAX_EXTRACT_CHARS);
++        method = "embedded";
++        console.log("[ASK-FILE] Embedded PDF text extracted", { length: extracted.length });
++      } else {
++        extractionStatus = "needs_ocr_images";
++        method = "ocr";
++        console.warn("[ASK-FILE] Embedded text too short, requesting browser OCR", {
++          length: embedded.length,
++          threshold: MIN_EMBEDDED_PDF_CHARS,
++        });
++      }
++    } catch (err) {
++      extractionStatus = "needs_ocr_images";
++      method = "ocr";
++      console.warn("[ASK-FILE] Embedded extraction failed; falling back to OCR images", {
++        error: err instanceof Error ? err.message : String(err),
++      });
++    }
++  } else {
++    try {
+       const ingest = await ingestBinaryForTranscript(env, { bytes, filename, mimeType });
+-      extracted = ingest?.text?.trim() || "";
++      if (ingest?.text) {
++        extracted = ingest.text.trim();
++        method = ingest.source === "ocr" ? "ocr" : "embedded";
++      }
+       if (!extracted && isImage) {
+         try {
+           const dataUrl = makeDataUrl(bytes, mimeType || "image/png");
+           extracted = await requestVisionOcrFromImages(env, [{ label: "Image", dataUrl }], filename);
++          method = "ocr";
+         } catch (err) {
+           console.warn("[ASK-FILE] Image OCR failed", err);
+         }
+@@ -1586,60 +1898,68 @@ async function handleAskFile(req: Request, env: Env): Promise<Response> {
+             if (visionFileId) {
+               console.log("[ASK-FILE] uploaded image for OCR", { file_id: visionFileId });
+               extracted = await requestVisionTextExtraction(env, visionFileId, filename);
++              method = "ocr";
+             }
+           } catch (err) {
+             console.warn("[ASK-FILE] Vision fallback failed", err);
+           }
+         }
+       }
+-    }
+-
+-    const refusalPhrases = [
+-      "unable to extract",
+-      "unable to extract text",
+-      "unable to read the pdf",
+-      "can't read the pdf",
+-      "can't read",
+-      "cannot read the pdf",
+-      "cannot read",
+-      "cannot process documents",
+-      "cannot access the pdf",
+-      "don't have the document",
+-      "process documents directly",
+-      "paste the text",
+-      "provide the text",
+-    ];
+-    const lower = extracted.toLowerCase();
+-    const isRefusal = refusalPhrases.some(p => lower.includes(p));
+-    const tooShort = (isPdf && extracted.length < 50) || false;
+-    if (!extracted || isRefusal || tooShort) {
+-      console.warn("[ASK-FILE] extraction invalid, aborting answer", {
+-        length: extracted.length,
+-        isRefusal,
+-        tooShort,
+-      });
++    } catch (err) {
++      extractionStatus = "error";
++      console.error("[ASK-FILE] Extraction error", err);
+       return json(
+         {
+-          extractionStatus: "error",
+-          extractionError: "PDF extraction failed. No document text was obtained.",
++          extractionStatus,
++          extractionError: err instanceof Error ? err.message : "Extraction failed.",
+           extractedTextPreview: "",
+           answer: "",
+         },
+         422,
+       );
+     }
++  }
+ 
+-    extracted = extracted.slice(0, MAX_EXTRACT_CHARS);
+-    extractionStatus = "ready";
+-    console.log("[ASK-FILE] extracted length", { length: extracted.length });
+-  } catch (err) {
+-    extractionStatus = "error";
+-    extractionError = err instanceof Error ? err.message : String(err);
+-    console.error("[ASK-FILE] Extraction error", err);
++  if (extractionStatus === "needs_ocr_images") {
++    return json({
++      extractionStatus,
++      method,
++      fileId,
++      pageCap: CLIENT_OCR_PAGE_CAP,
++      message: "Browser OCR required; render pages to images and retry.",
++    });
++  }
++
++  const refusalPhrases = [
++    "unable to extract",
++    "unable to extract text",
++    "unable to read the pdf",
++    "can't read the pdf",
++    "can't read",
++    "cannot read the pdf",
++    "cannot read",
++    "cannot process documents",
++    "cannot access the pdf",
++    "don't have the document",
++    "process documents directly",
++    "paste the text",
++    "provide the text",
++  ];
++  const normalized = normalizeExtractedText(extracted).slice(0, MAX_EXTRACT_CHARS);
++  const lower = normalized.toLowerCase();
++  const isRefusal = refusalPhrases.some(p => lower.includes(p));
++  const tooShort = normalized.length < 50;
++  if (!normalized || isRefusal || tooShort) {
++    console.warn("[ASK-FILE] extraction invalid, aborting answer", {
++      length: normalized.length,
++      isRefusal,
++      tooShort,
++      method,
++    });
+     return json(
+       {
+-        extractionStatus,
+-        extractionError: extractionError || "PDF extraction returned no text.",
++        extractionStatus: "error",
++        extractionError: "Extraction returned no usable text. Try OCR images.",
+         extractedTextPreview: "",
+         answer: "",
+       },
+@@ -1647,14 +1967,25 @@ async function handleAskFile(req: Request, env: Env): Promise<Response> {
+     );
+   }
+ 
++  let persisted: { extractedKey: string; bucket: string; preview: string };
++  try {
++    persisted = await persistExtractedText(env, fileId, normalized);
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[ASK-FILE] Failed to persist extracted text", err);
++    return json({ error: "persist_failed", details: msg }, 500);
++  }
++
+   try {
+     console.log("[ASK-FILE] extraction valid, answering");
+-    const answer = await answerWithContext(env, extracted, message);
++    const answer = await answerWithContext(env, normalized, message);
+     return json({
+       answer,
+-      extractedTextPreview: extracted.slice(0, ONE_SHOT_PREVIEW_LIMIT),
++      extractedTextPreview: persisted.preview,
+       extractionStatus,
+-      extractionError,
++      method,
++      extractedKey: persisted.extractedKey,
++      fileId,
+       elapsed_ms: Date.now() - startTime,
+     });
+   } catch (err) {
+@@ -1663,9 +1994,11 @@ async function handleAskFile(req: Request, env: Env): Promise<Response> {
+     return json(
+       {
+         answer: "",
+-        extractedTextPreview: extracted.slice(0, ONE_SHOT_PREVIEW_LIMIT),
++        extractedTextPreview: persisted.preview,
+         extractionStatus: "error",
+         extractionError: msg,
++        method,
++        fileId,
+         elapsed_ms: Date.now() - startTime,
+       },
+       502,
+@@ -1712,6 +2045,812 @@ async function answerWithContext(env: Env, context: string, question: string): P
+   return extractOutputText(data).trim();
+ }
+ 
++async function answerWithRetrievedChunks(env: Env, chunks: Array<{ index: number; text: string }>, question: string): Promise<string> {
++  const system = [
++    "You are OWEN answering questions grounded in retrieved document chunks.",
++    "Use ONLY the provided chunks; cite them inline using [C#] where # is the chunk number.",
++    "If the chunks lack the answer, say you don't know briefly.",
++  ].join(" ");
++
++  const context = chunks
++    .map(chunk => `[Chunk ${chunk.index + 1}]\n${chunk.text}`)
++    .join("\n\n");
++
++  const payload = {
++    model: resolveModelId("gpt-5-mini", env),
++    input: [
++      { role: "system" as const, content: [{ type: "input_text" as const, text: system }] },
++      {
++        role: "user" as const,
++        content: [
++          { type: "input_text" as const, text: `Context chunks:\n${context}` },
++          { type: "input_text" as const, text: `Question:\n${question}` },
++        ],
++      },
++    ],
++  };
++
++  const base = env.OPENAI_API_BASE?.replace(/\/$/, "") || "https://api.openai.com/v1";
++  const resp = await fetch(`${base}/responses`, {
++    method: "POST",
++    headers: {
++      authorization: `Bearer ${env.OPENAI_API_KEY}`,
++      "content-type": "application/json",
++    },
++    body: JSON.stringify(payload),
++  });
++
++  const data = await safeJson(resp);
++  if (!resp.ok) {
++    const msg = data?.error?.message || resp.statusText || "Answering failed.";
++    throw new Error(msg);
++  }
++  return extractOutputText(data).trim();
++}
++
++async function handleLibrarySearch(req: Request, env: Env): Promise<Response> {
++  const url = new URL(req.url);
++  const q = url.searchParams.get("q")?.trim() || "";
++  const limitParam = Number(url.searchParams.get("limit"));
++  const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 50) : LIBRARY_SEARCH_LIMIT;
++  const { bucket } = getLibraryBucket(env);
++  const indexRecords = await readLibraryIndex(bucket);
++  const ranked = q ? scoreLibraryRecords(q, indexRecords, limit * 2) : indexRecords.slice(0, limit);
++  const selected = ranked.slice(0, limit);
++
++  const results: Array<{ docId: string; title: string; bucket: string; key: string; status: "ready" | "missing" | "needs_browser_ocr"; preview?: string; extractedKey: string; }> = [];
++  for (const rec of selected) {
++    const extractedKey = rec.extractedKey || buildExtractedPath(rec.docId);
++    let status: "ready" | "missing" | "needs_browser_ocr" = rec.status || "missing";
++    if (status !== "needs_browser_ocr") {
++      try {
++        const head = typeof bucket.head === "function" ? await bucket.head(extractedKey) : await bucket.get(extractedKey, { range: { offset: 0, length: 0 } as any });
++        status = head ? "ready" : status;
++      } catch {
++        status = rec.status || "missing";
++      }
++    }
++    results.push({
++      docId: rec.docId,
++      title: rec.title,
++      bucket: rec.bucket,
++      key: rec.key,
++      status,
++      preview: normalizePreview(rec.preview),
++      extractedKey,
++    });
++  }
++
++  return json({ results });
++}
++
++async function handleLibraryIngest(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => null);
++  if (!body || typeof body !== "object") {
++    return json({ error: "Send JSON { bucket, key }." }, 400);
++  }
++  const bucketName = typeof (body as any).bucket === "string" ? (body as any).bucket.trim() : "";
++  const key = typeof (body as any).key === "string" ? sanitizeKey((body as any).key, "") : "";
++  if (!bucketName || !key) return json({ error: "Missing bucket or key." }, 400);
++
++  try {
++    const result = await ingestLibraryObject(env, { bucketName, key });
++    return json(result);
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[LIBRARY-INGEST] failed", { bucketName, key, error: msg });
++    return json({ error: "library_ingest_failed", details: msg }, 500);
++  }
++}
++
++async function handleLibraryAsk(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => null);
++  if (!body || typeof body !== "object") {
++    return json({ error: "Send JSON { docId, question }." }, 400);
++  }
++  const docId = typeof (body as any).docId === "string" ? (body as any).docId.trim() : "";
++  const question = typeof (body as any).question === "string" ? (body as any).question.trim() : "";
++  if (!docId || !question) return json({ error: "Missing docId or question." }, 400);
++
++  const { bucket } = getLibraryBucket(env);
++  const cache = await loadCachedExtraction(bucket, docId);
++  if (!cache.text) {
++    return json({ error: "extracted_text_not_found", details: "No cached extraction for this docId." }, 404);
++  }
++  const text = cache.text.slice(0, MAX_OCR_TEXT_LENGTH);
++  const chunks = chunkText(text, { size: RETRIEVAL_CHUNK_SIZE, overlap: RETRIEVAL_CHUNK_OVERLAP });
++  const ranked = rankChunks(question, chunks, RETRIEVAL_TOP_K);
++  const selected = ranked.length ? ranked : chunks.slice(0, Math.min(RETRIEVAL_TOP_K, chunks.length));
++  console.log("[LIBRARY-ASK] retrieval", { docId, totalChunks: chunks.length, selected: selected.map(c => c.index) });
++
++  try {
++    const answer = await answerWithRetrievedChunks(env, selected, question);
++    const sources = selected.map(chunk => ({
++      chunkId: chunk.index,
++      snippet: chunk.text.slice(0, 280),
++    }));
++    return json({ answer, docId, extractedKey: cache.extractedKey, sources });
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[LIBRARY-ASK] failed", { docId, error: msg });
++    return json({ error: "answer_failed", details: msg }, 502);
++  }
++}
++
++async function handleLibraryBatchIndex(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => ({}));
++  const bucketsInput = Array.isArray((body as any).buckets) ? (body as any).buckets : null;
++  const bucketNames = bucketsInput?.length
++    ? bucketsInput.map((b: unknown) => String(b)).filter(Boolean)
++    : Object.keys(BUCKET_BINDINGS);
++
++  const { bucket: libraryBucket } = getLibraryBucket(env);
++  const records: LibraryIndexRecord[] = [];
++  let totalObjects = 0;
++  let indexed = 0;
++
++  for (const bucketName of bucketNames) {
++    let lookup: R2Bucket;
++    try {
++      lookup = getBucketByName(env, bucketName);
++    } catch {
++      console.warn("[LIBRARY-BATCH-INDEX] unknown bucket", { bucketName });
++      continue;
++    }
++    const objects = await listPdfObjectsFromBucket(lookup);
++    totalObjects += objects.length;
++    for (const obj of objects) {
++      const { docId, basis, fieldsUsed, uploaded } = await computeDocId(bucketName, obj.key, {
++        etag: obj.etag,
++        size: obj.size,
++        uploaded: obj.uploaded,
++      });
++      const title = titleFromKey(obj.key);
++      const extractedKey = buildExtractedPath(docId);
++      let status: "ready" | "missing" | "needs_browser_ocr" = "missing";
++      const manifest = await readManifest(libraryBucket, docId);
++      if (manifest && manifest.method === "ocr" && !manifest.pagesProcessed) {
++        status = "needs_browser_ocr";
++      }
++      try {
++        const head = typeof libraryBucket.head === "function" ? await libraryBucket.head(extractedKey) : await libraryBucket.get(extractedKey, { range: { offset: 0, length: 0 } as any });
++        if (head) status = "ready";
++      } catch {
++        status = "missing";
++      }
++      const record: LibraryIndexRecord = {
++        docId,
++        bucket: bucketName,
++        key: obj.key,
++        title,
++        normalizedTokens: tokensFromTitle(title),
++        hashBasis: basis,
++        hashFieldsUsed: fieldsUsed,
++        etag: obj.etag,
++        size: obj.size,
++        uploaded: uploaded || obj.uploaded?.toISOString?.(),
++        status,
++        extractedKey,
++        manifestKey: buildManifestPath(docId),
++      };
++      records.push(record);
++      indexed += 1;
++    }
++  }
++
++  if (records.length) {
++    await writeLibraryIndex(libraryBucket, records);
++    await Promise.all(
++      records.map(rec =>
++        libraryBucket.put(buildIndexKeyForDoc(rec.docId), JSON.stringify(rec), {
++          httpMetadata: { contentType: "application/json; charset=utf-8" },
++        }),
++      ),
++    );
++  }
++
++  return json({
++    status: "ok",
++    buckets: bucketNames,
++    indexed,
++    totalObjects,
++    indexKey: LIBRARY_INDEX_KEY,
++  });
++}
++
++async function handleLibraryBatchIngest(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => ({}));
++  const bucketsInput = Array.isArray((body as any).buckets) ? (body as any).buckets : null;
++  const modeInput = typeof (body as any).mode === "string" ? (body as any).mode : "embedded_only";
++  const mode = modeInput === "full" ? "full" : "embedded_only";
++  const maxDocsRaw = Number((body as any).maxDocs);
++  const maxDocs = Number.isFinite(maxDocsRaw) && maxDocsRaw > 0 ? maxDocsRaw : undefined;
++  const bucketNames = bucketsInput?.length
++    ? bucketsInput.map((b: unknown) => String(b)).filter(Boolean)
++    : Object.keys(BUCKET_BINDINGS);
++
++  const queue: Array<{ docId: string; bucket: string; key: string; title: string; pageCount?: number; downloadUrl: string }> = [];
++  let processed = 0;
++  let ready = 0;
++  let skipped = 0;
++  let needsBrowser = 0;
++
++  for (const bucketName of bucketNames) {
++    let lookup: R2Bucket;
++    try {
++      lookup = getBucketByName(env, bucketName);
++    } catch {
++      console.warn("[LIBRARY-BATCH-INGEST] unknown bucket", { bucketName });
++      continue;
++    }
++    const objects = await listPdfObjectsFromBucket(lookup, { limit: maxDocs ? Math.max(1, maxDocs - processed) : undefined });
++    for (const obj of objects) {
++      if (maxDocs && processed >= maxDocs) break;
++      processed += 1;
++      try {
++        const result = await ingestLibraryObject(env, { bucketName, key: obj.key, skipCache: false, mode });
++        if (result.status === "cache_hit") {
++          skipped += 1;
++          continue;
++        }
++        if (result.status === "needs_browser_ocr") {
++          needsBrowser += 1;
++          if (mode === "full" && queue.length < LIBRARY_QUEUE_MAX) {
++            queue.push({
++              docId: result.docId,
++              bucket: bucketName,
++              key: obj.key,
++              title: titleFromKey(obj.key),
++              pageCount: result.pageCount,
++              downloadUrl: result.downloadUrl || buildLibraryDownloadUrl(bucketName, obj.key),
++            });
++          }
++          continue;
++        }
++        ready += 1;
++      } catch (err) {
++        console.warn("[LIBRARY-BATCH-INGEST] failed for object", { bucketName, key: obj.key, error: err instanceof Error ? err.message : String(err) });
++      }
++    }
++  }
++
++  let queueKey = "";
++  if (queue.length) {
++    const { bucket } = getLibraryBucket(env);
++    queueKey = `${LIBRARY_QUEUE_PREFIX}${Date.now()}.json`;
++    await bucket.put(queueKey, JSON.stringify({ docs: queue, createdAt: new Date().toISOString() }), {
++      httpMetadata: { contentType: "application/json; charset=utf-8" },
++    });
++  }
++
++  return json({
++    status: "ok",
++    mode,
++    processed,
++    ready,
++    skipped,
++    needs_browser_ocr: needsBrowser,
++    queueKey: queueKey || undefined,
++    queued: queue.length,
++  });
++}
++
++async function handleSignedUrl(req: Request, env: Env): Promise<Response> {
++  const url = new URL(req.url);
++  const bucketName = url.searchParams.get("bucket") || "";
++  const key = url.searchParams.get("key") || "";
++  if (!bucketName || !key) {
++    return json({ error: "Missing bucket or key." }, 400);
++  }
++  try {
++    const bucket = getBucketByName(env, bucketName);
++    const exists = typeof bucket.head === "function" ? await bucket.head(key) : await bucket.get(key, { range: { offset: 0, length: 0 } as any });
++    if (!exists) return json({ error: "Not found." }, 404);
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    return json({ error: "Not found", details: msg }, 404);
++  }
++  const downloadUrl = buildLibraryDownloadUrl(bucketName, key);
++  return json({ url: downloadUrl, bucket: bucketName, key });
++}
++
++async function handleAskDoc(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => null);
++  if (!body || typeof body !== "object") {
++    return json({ error: "Send JSON { extractedKey?, fileHash?, question }." }, 400);
++  }
++  const question = typeof (body as any).question === "string" ? (body as any).question.trim() : "";
++  const extractedKeyInput = typeof (body as any).extractedKey === "string" ? (body as any).extractedKey.trim() : "";
++  const fileHash = typeof (body as any).fileHash === "string" ? (body as any).fileHash.trim() : "";
++  if (!question) return json({ error: "Missing question." }, 400);
++  if (!extractedKeyInput && !fileHash) return json({ error: "Provide extractedKey or fileHash." }, 400);
++
++  const extractedKey = extractedKeyInput || buildExtractedKeyForHash(fileHash);
++  const { bucket } = getExtractionBucket(env);
++  const object = await bucket.get(extractedKey);
++  if (!object || !object.body) {
++    return json({ error: "extracted_text_not_found", details: "No extracted text stored for this file." }, 404);
++  }
++  const text = normalizePlainText(await object.text()).slice(0, MAX_OCR_TEXT_LENGTH);
++  if (!text) {
++    return json({ error: "extracted_text_empty", details: "Stored text is empty." }, 404);
++  }
++
++  const chunks = chunkText(text, { size: RETRIEVAL_CHUNK_SIZE, overlap: RETRIEVAL_CHUNK_OVERLAP });
++  const ranked = rankChunks(question, chunks, RETRIEVAL_TOP_K);
++  const selected = ranked.length ? ranked : chunks.slice(0, Math.min(RETRIEVAL_TOP_K, chunks.length));
++  console.log("[ASK-DOC] retrieval", {
++    extractedKey,
++    totalChunks: chunks.length,
++    selectedChunks: selected.map(chunk => chunk.index),
++  });
++
++  try {
++    const answer = await answerWithRetrievedChunks(env, selected, question);
++    return json({
++      answer,
++      method: "retrieval",
++      extractedKey,
++      chunksUsed: selected.map(chunk => chunk.index),
++    });
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[ASK-DOC] Answer failed", err);
++    return json({ error: "answer_failed", details: msg }, 502);
++  }
++}
++
++async function handleOcrPage(req: Request, env: Env): Promise<Response> {
++  const contentType = req.headers.get("content-type") || "";
++  if (!contentType.includes("multipart/form-data")) {
++    return json({ error: "Send multipart/form-data with fields: fileId, pageIndex, image" }, 400);
++  }
++  const form = await req.formData();
++  const fileId = typeof form.get("fileId") === "string" ? (form.get("fileId") as string).trim() : "";
++  const fileHash = typeof form.get("fileHash") === "string" ? (form.get("fileHash") as string).trim() : "";
++  const rawIndex = form.get("pageIndex");
++  const pageIndex = typeof rawIndex === "string" ? Number(rawIndex) : Number(rawIndex);
++  const image = form.get("image");
++
++  if (!fileId && !fileHash) return json({ error: "Missing fileId or fileHash." }, 400);
++  if (!Number.isFinite(pageIndex)) return json({ error: "Invalid pageIndex." }, 400);
++  if (!(image instanceof File)) return json({ error: "Missing image file." }, 400);
++
++  try {
++    const mimeType = image.type || "image/png";
++    const bytes = new Uint8Array(await image.arrayBuffer());
++    const dataUrl = makeDataUrl(bytes, mimeType);
++    const label = Number.isFinite(pageIndex) ? `Page ${Number(pageIndex) + 1}` : "Page";
++    const started = Date.now();
++    const prompt = "You are an OCR service. Transcribe every readable character from the page image. Return plain text only.";
++    const text = await callResponsesOcr(
++      env,
++      [
++        { type: "input_text", text: prompt },
++        { type: "input_image", image_url: dataUrl, detail: "high" as InputImageDetail },
++      ],
++      { label: `ocr-page:${fileHash || fileId}:${pageIndex}`, maxOutputTokens: OCR_PAGE_OUTPUT_TOKENS },
++    );
++    const normalized = normalizeExtractedText(text).slice(0, MAX_OCR_TEXT_LENGTH);
++    if (!normalized) {
++      return json({ error: "ocr_empty", details: "No text extracted for this page." }, 422);
++    }
++    console.log("[OCR-PAGE] completed", {
++      fileHash: fileHash || fileId,
++      pageIndex,
++      bytes: bytes.length,
++      ms: Date.now() - started,
++      length: normalized.length,
++    });
++    return json({ pageIndex: Number(pageIndex), text: normalized });
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[OCR-PAGE] Failed", { fileHash: fileHash || fileId, pageIndex, error: msg });
++    return json({ error: "ocr_failed", details: msg }, 502);
++  }
++}
++
++async function handleOcrFinalize(req: Request, env: Env): Promise<Response> {
++  const body = await req.json().catch(() => null);
++  if (!body || typeof body !== "object") {
++    return json({ error: "Send JSON { fileId?, fileHash?, pages: [{ pageIndex, text }] }." }, 400);
++  }
++  const fileId = typeof (body as any).fileId === "string" ? (body as any).fileId.trim() : "";
++  const fileHash = typeof (body as any).fileHash === "string" ? (body as any).fileHash.trim() : "";
++  const filename = typeof (body as any).filename === "string" ? (body as any).filename : undefined;
++  const pages = Array.isArray((body as any).pages) ? (body as any).pages : [];
++  const totalPages = Number((body as any).totalPages);
++  if (!fileId && !fileHash) return json({ error: "Missing fileId or fileHash." }, 400);
++  if (!pages.length) return json({ error: "No pages provided." }, 400);
++
++  const normalizedPages = pages
++    .map((entry: any) => {
++      const idxRaw = typeof entry?.pageIndex === "number" ? entry.pageIndex : Number(entry?.pageIndex);
++      const text = typeof entry?.text === "string" ? entry.text : "";
++      if (!Number.isFinite(idxRaw)) return null;
++      const clean = normalizeExtractedText(text);
++      if (!clean) return null;
++      return { pageIndex: Number(idxRaw), text: clean };
++    })
++    .filter(
++      (p: { pageIndex: number; text: string } | null): p is { pageIndex: number; text: string } => Boolean(p),
++    )
++    .sort((a: { pageIndex: number; text: string }, b: { pageIndex: number; text: string }) => a.pageIndex - b.pageIndex);
++
++  if (!normalizedPages.length) {
++    return json({ error: "No text to finalize.", details: "All pages were empty." }, 422);
++  }
++
++  const normalizedResult = normalizePages(normalizedPages);
++  const combined = normalizedResult.text.slice(0, MAX_OCR_TEXT_LENGTH);
++
++  if (!combined.trim()) {
++    return json({ error: "finalize_empty", details: "Combined OCR text is empty." }, 422);
++  }
++
++  const { bucket } = getExtractionBucket(env);
++  const extractedKey = fileHash ? buildExtractedKeyForHash(fileHash) : buildExtractedKey(fileId);
++  const existingPages = new Map<number, string>();
++  let manifest: PdfManifest | null = null;
++  if (fileHash) {
++    manifest = await readManifest(bucket, fileHash);
++  }
++  try {
++    const existing = await bucket.get(extractedKey);
++    if (existing && existing.body) {
++      const existingText = normalizePlainText(await existing.text());
++      parseNormalizedPagesFromText(existingText).forEach((text, pageIdx) => existingPages.set(pageIdx, text));
++    }
++  } catch {}
++
++  normalizedPages.forEach(page => {
++    existingPages.set(page.pageIndex, page.text.trim());
++  });
++
++  const rebuilt = Array.from(existingPages.entries())
++    .sort((a, b) => a[0] - b[0])
++    .map(([pageIndex, text]) => `--- Page ${pageIndex + 1} ---\n${text}`)
++    .join("\n\n");
++
++  const normalizedFinal = normalizePlainText(rebuilt).slice(0, MAX_OCR_TEXT_LENGTH);
++
++  try {
++    await bucket.put(extractedKey, normalizedFinal, {
++      httpMetadata: { contentType: "text/plain; charset=utf-8" },
++    });
++    const preview = normalizedFinal.slice(0, ONE_SHOT_PREVIEW_LIMIT);
++    if (fileHash) {
++      const newRanges = mergeRanges([
++        ...(manifest?.ranges || []),
++        ...buildRangesFromPages(normalizedPages.map(p => p.pageIndex)),
++      ]);
++      const pagesProcessed = newRanges.reduce((total, range) => total + (range.end - range.start + 1), 0);
++      const nextManifest: PdfManifest = {
++        fileHash,
++        filename: manifest?.filename || filename,
++        method: "ocr",
++        pagesProcessed,
++        pageCount: Number.isFinite(totalPages) ? Number(totalPages) : manifest?.pageCount,
++        ranges: newRanges,
++        createdAt: manifest?.createdAt || new Date().toISOString(),
++        preview,
++      };
++      await writeManifest(bucket, nextManifest);
++      console.log("[OCR-FINALIZE] persisted OCR text", {
++        fileHash,
++        pagesProcessed,
++        pageCount: nextManifest.pageCount,
++        ranges: newRanges,
++      });
++    }
++    return json({
++      extractionStatus: "ok",
++      method: "ocr",
++      extractedKey,
++      preview,
++      fileId,
++      fileHash,
++      pageCount: Number.isFinite(totalPages) ? Number(totalPages) : undefined,
++    });
++  } catch (err) {
++    const msg = err instanceof Error ? err.message : String(err);
++    console.error("[OCR-FINALIZE] Failed to persist OCR text", { fileId: fileHash || fileId, error: msg });
++    return json({ error: "persist_failed", details: msg }, 500);
++  }
++}
++
++async function ingestLibraryObject(
++  env: Env,
++  {
++    bucketName,
++    key,
++    skipCache = false,
++    mode = "single",
++  }: { bucketName: string; key: string; skipCache?: boolean; mode?: "embedded_only" | "full" | "single" },
++) {
++  const cleanedKey = sanitizeKey(key, key);
++  const sourceLookup = lookupBucket(env, bucketName) || lookupBucket(env, BUCKET_BINDINGS[bucketName as keyof typeof BUCKET_BINDINGS]);
++  if (!sourceLookup) {
++    throw new Error(`Unknown bucket: ${bucketName}`);
++  }
++  const sourceBucket = sourceLookup.bucket;
++  const { bucket: libraryBucket } = getLibraryBucket(env);
++
++  const head = typeof sourceBucket.head === "function" ? await sourceBucket.head(cleanedKey).catch(() => null) : null;
++  const metaSource = head || (await sourceBucket.get(cleanedKey));
++  if (!metaSource) {
++    throw new Error("Object not found.");
++  }
++
++  const { docId, basis, fieldsUsed, uploaded } = await computeDocId(bucketName, cleanedKey, {
++    etag: metaSource.etag,
++    size: metaSource.size,
++    uploaded: (metaSource as any)?.uploaded,
++  });
++  const extractedKey = buildExtractedPath(docId);
++  const manifestKey = buildManifestPath(docId);
++  const title = titleFromKey(cleanedKey);
++
++  if (!skipCache) {
++    try {
++      const existing = typeof libraryBucket.head === "function" ? await libraryBucket.head(extractedKey) : await libraryBucket.get(extractedKey, { range: { offset: 0, length: 0 } as any });
++      if (existing) {
++        const manifest = await readManifest(libraryBucket, docId);
++        await upsertLibraryIndexRecord(env, {
++          docId,
++          bucket: bucketName,
++          key: cleanedKey,
++          title,
++          hashBasis: basis,
++          hashFieldsUsed: fieldsUsed,
++          normalizedTokens: tokensFromTitle(title),
++          status: "ready",
++          extractedKey,
++          manifestKey,
++          preview: manifest?.preview,
++          size: metaSource.size,
++          etag: metaSource.etag,
++          uploaded: uploaded || (metaSource as any)?.uploaded?.toISOString?.(),
++        });
++        return { status: "cache_hit", docId, extractedKey, manifest };
++      }
++    } catch {
++      // ignore cache probe failure
++    }
++  }
++
++  const cachedManifest = await readManifest(libraryBucket, docId);
++  if (cachedManifest && cachedManifest.method === "ocr" && !cachedManifest.pagesProcessed) {
++    await upsertLibraryIndexRecord(env, {
++      docId,
++      bucket: bucketName,
++      key: cleanedKey,
++      title,
++      hashBasis: basis,
++      hashFieldsUsed: fieldsUsed,
++      normalizedTokens: tokensFromTitle(title),
++      status: "needs_browser_ocr",
++      extractedKey,
++      manifestKey,
++      preview: cachedManifest.preview,
++      size: metaSource.size,
++      etag: metaSource.etag,
++      uploaded: uploaded || (metaSource as any)?.uploaded?.toISOString?.(),
++    });
++    return {
++      status: "needs_browser_ocr",
++      docId,
++      bucket: bucketName,
++      key: cleanedKey,
++      pageCount: cachedManifest.pageCount,
++      downloadUrl: buildLibraryDownloadUrl(bucketName, cleanedKey),
++    };
++  }
++
++  const objectWithBody = head && (head as any).body ? (head as any as R2ObjectBody) : await sourceBucket.get(cleanedKey);
++  if (!objectWithBody || !objectWithBody.body) {
++    throw new Error("Object body unavailable for ingestion.");
++  }
++  const bytes = new Uint8Array(await objectWithBody.arrayBuffer());
++  const extraction = await extractEmbeddedPagesFromPdf(bytes, {
++    sampleCount: PDF_SAMPLE_PAGE_TARGET,
++    maxPages: mode === "embedded_only" ? LIBRARY_BATCH_PAGE_LIMIT : MAX_EXTRACT_PAGES,
++    allowEarlyStop: true,
++  });
++
++  if (extraction.scanned || !extraction.pages.length) {
++    const manifest: PdfManifest = {
++      fileHash: docId,
++      filename: title,
++      method: "ocr",
++      extractionMethod: "ocr",
++      pagesProcessed: 0,
++      pageCount: extraction.pageCount,
++      createdAt: new Date().toISOString(),
++      bucket: bucketName,
++      key: cleanedKey,
++      docId,
++      hashBasis: basis,
++      hashFieldsUsed: fieldsUsed,
++      title,
++    };
++    await writeManifest(libraryBucket, manifest);
++    await upsertLibraryIndexRecord(env, {
++      docId,
++      bucket: bucketName,
++      key: cleanedKey,
++      title,
++      hashBasis: basis,
++      hashFieldsUsed: fieldsUsed,
++      normalizedTokens: tokensFromTitle(title),
++      status: "needs_browser_ocr",
++      extractedKey,
++      manifestKey,
++      preview: "",
++      size: metaSource.size,
++      etag: metaSource.etag,
++      uploaded: uploaded || (metaSource as any)?.uploaded?.toISOString?.(),
++    });
++    return {
++      status: "needs_browser_ocr",
++      docId,
++      bucket: bucketName,
++      key: cleanedKey,
++      pageCount: extraction.pageCount,
++      downloadUrl: buildLibraryDownloadUrl(bucketName, cleanedKey),
++    };
++  }
++
++  const normalized = normalizePages(extraction.pages);
++  const finalText = normalized.text.slice(0, MAX_OCR_TEXT_LENGTH);
++  const preview = finalText.slice(0, ONE_SHOT_PREVIEW_LIMIT);
++  await libraryBucket.put(extractedKey, finalText, {
++    httpMetadata: { contentType: "text/plain; charset=utf-8" },
++  });
++  const manifest: PdfManifest = {
++    fileHash: docId,
++    filename: title,
++    method: "embedded",
++    extractionMethod: "embedded",
++    pagesProcessed: normalized.pagesProcessed,
++    pageCount: extraction.pageCount,
++    createdAt: new Date().toISOString(),
++    preview,
++    bucket: bucketName,
++    key: cleanedKey,
++    docId,
++    hashBasis: basis,
++    hashFieldsUsed: fieldsUsed,
++    title,
++  };
++  await writeManifest(libraryBucket, manifest);
++  await upsertLibraryIndexRecord(env, {
++    docId,
++    bucket: bucketName,
++    key: cleanedKey,
++    title,
++    hashBasis: basis,
++    hashFieldsUsed: fieldsUsed,
++    normalizedTokens: tokensFromTitle(title),
++    status: "ready",
++    extractedKey,
++    manifestKey,
++    preview,
++    size: metaSource.size,
++    etag: metaSource.etag,
++    uploaded: uploaded || (metaSource as any)?.uploaded?.toISOString?.(),
++  });
++
++  return { status: "ok", docId, extractedKey, manifest, preview, pageCount: extraction.pageCount };
++}
++
++async function upsertLibraryIndexRecord(env: Env, record: LibraryIndexRecord) {
++  const { bucket } = getLibraryBucket(env);
++  const existing = await readLibraryIndex(bucket);
++  const map = new Map<string, LibraryIndexRecord>();
++  existing.forEach(rec => map.set(rec.docId, rec));
++
++  const prior = map.get(record.docId);
++  const normalizedTokens = record.normalizedTokens?.length
++    ? record.normalizedTokens
++    : prior?.normalizedTokens?.length
++      ? prior.normalizedTokens
++      : tokensFromTitle(record.title);
++
++  const merged: LibraryIndexRecord = {
++    ...(prior || {}),
++    ...record,
++    normalizedTokens,
++    status: record.status || prior?.status,
++    preview: normalizePreview(record.preview || prior?.preview),
++    manifestKey: record.manifestKey || prior?.manifestKey || buildManifestPath(record.docId),
++    extractedKey: record.extractedKey || prior?.extractedKey || buildExtractedPath(record.docId),
++  };
++  map.set(record.docId, merged);
++  const nextList = Array.from(map.values());
++  await writeLibraryIndex(bucket, nextList);
++  await bucket.put(buildIndexKeyForDoc(record.docId), JSON.stringify(merged), {
++    httpMetadata: { contentType: "application/json; charset=utf-8" },
++  });
++  return merged;
++}
++
++async function listPdfObjectsFromBucket(bucket: R2Bucket, opts: { limit?: number } = {}) {
++  const results: R2Object[] = [];
++  let cursor: string | undefined;
++  const limit = opts.limit ?? 0;
++  do {
++    const page = await bucket.list({ cursor, limit: 1000 });
++    for (const obj of page.objects ?? []) {
++      if (isPdfKey(obj.key)) {
++        results.push(obj);
++        if (limit && results.length >= limit) {
++          return results;
++        }
++      }
++    }
++    cursor = page.truncated ? page.cursor : undefined;
++  } while (cursor);
++  return results;
++}
++
++function buildLibraryDownloadUrl(bucket: string, key: string) {
++  const base = `/api/file?bucket=${encodeURIComponent(bucket)}&key=${encodeURIComponent(key)}`;
++  return base;
++}
++
++function buildRangesFromPages(pageIndices: number[]) {
++  const sorted = Array.from(new Set(pageIndices.map(idx => Number(idx) + 1).filter(n => Number.isFinite(n)))).sort((a, b) => a - b);
++  const ranges: Array<{ start: number; end: number }> = [];
++  if (!sorted.length) return ranges;
++  let start = sorted[0];
++  let end = sorted[0];
++  for (let i = 1; i < sorted.length; i += 1) {
++    const current = sorted[i];
++    if (current === end + 1) {
++      end = current;
++    } else {
++      ranges.push({ start, end });
++      start = current;
++      end = current;
++    }
++  }
++  ranges.push({ start, end });
++  return ranges;
++}
++
++function mergeRanges(ranges: Array<{ start: number; end: number }>) {
++  const cleaned = ranges
++    .filter(range => Number.isFinite(range.start) && Number.isFinite(range.end))
++    .map(range => (range.start <= range.end ? { start: range.start, end: range.end } : { start: range.end, end: range.start }))
++    .sort((a, b) => a.start - b.start);
++  if (!cleaned.length) return [];
++  const merged: Array<{ start: number; end: number }> = [cleaned[0]];
++  for (let i = 1; i < cleaned.length; i += 1) {
++    const current = cleaned[i];
++    const last = merged[merged.length - 1];
++    if (current.start <= last.end + 1) {
++      last.end = Math.max(last.end, current.end);
++    } else {
++      merged.push({ start: current.start, end: current.end });
++    }
++  }
++  return merged;
++}
++
++function parseNormalizedPagesFromText(text: string) {
++  const map = new Map<number, string>();
++  const parts = (text || "").split(/---\s*Page\s+(\d+)\s*---/i);
++  for (let i = 1; i < parts.length; i += 2) {
++    const pageNumber = Number(parts[i]);
++    const pageText = parts[i + 1] || "";
++    if (Number.isFinite(pageNumber)) {
++      map.set(pageNumber - 1, normalizePlainText(pageText));
++    }
++  }
++  return map;
++}
++
+ async function handleGenerateFile(req: Request, env: Env): Promise<Response> {
+   const raw = await req.json().catch(() => null);
+   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+@@ -1954,7 +3093,7 @@ function inferIngestKind(filename: string, mimeType?: string | null): IngestKind
+   return "other";
+ }
+ 
+-type OcrPrimitiveOptions = { label?: string };
++type OcrPrimitiveOptions = { label?: string; maxOutputTokens?: number };
+ 
+ async function callResponsesOcr(
+   env: Env,
+@@ -1962,6 +3101,7 @@ async function callResponsesOcr(
+   opts: OcrPrimitiveOptions = {},
+ ): Promise<string> {
+   const base = env.OPENAI_API_BASE?.replace(/\/$/, "") || "https://api.openai.com/v1";
++  const maxTokens = Math.min(OCR_MAX_OUTPUT_TOKENS, Math.max(200, opts.maxOutputTokens ?? OCR_MAX_OUTPUT_TOKENS));
+   const payload = {
+     model: resolveModelId("gpt-4o", env),
+     input: [
+@@ -1970,7 +3110,7 @@ async function callResponsesOcr(
+         content,
+       },
+     ],
+-    max_output_tokens: OCR_MAX_OUTPUT_TOKENS,
++    max_output_tokens: maxTokens,
+   };
+ 
+   console.log("[OCR] Sending /responses request", {
+@@ -2155,14 +3295,7 @@ function makeDataUrl(bytes: Uint8Array, mimeType: string): string {
+ }
+ 
+ function normalizeExtractedText(value: string): string {
+-  return (value || "")
+-    .replace(/\r\n/g, "\n")
+-    .replace(/\r/g, "\n")
+-    .replace(/\u0000/g, "")
+-    .replace(/[ \t]+\n/g, "\n")
+-    .replace(/\n{3,}/g, "\n\n")
+-    .replace(/[ \t]{2,}/g, " ")
+-    .trim();
++  return normalizePlainText(value);
+ }
+ 
+ async function ingestBinaryForTranscript(
+@@ -2204,17 +3337,8 @@ async function ingestBinaryForTranscript(
+           error: err instanceof Error ? err.message : String(err),
+         });
+       }
+-      try {
+-        const ocr = await ocrPdfBytesWithVision(env, bytes, name);
+-        if (ocr) {
+-          return { text: ocr.slice(0, MAX_OCR_TEXT_LENGTH), source: "ocr" };
+-        }
+-      } catch (err) {
+-        console.warn("PDF OCR ingestion failed; allowing fallback", {
+-          filename: name,
+-          error: err instanceof Error ? err.message : String(err),
+-        });
+-      }
++    } else {
++      console.log("PDF.js unavailable in Worker; skipping embedded extraction.", { filename: name });
+     }
+     // If pdfjs is not available, return null to let the legacy CI extraction path run.
+     return null;
+@@ -2240,32 +3364,88 @@ async function ingestBinaryForTranscript(
+   return null;
+ }
+ 
+-async function extractEmbeddedTextFromPdf(pdfBytes: Uint8Array): Promise<string> {
+-  if (!PDFJS_AVAILABLE) throw new Error("pdfjs unavailable");
++function buildSamplePageNumbers(pageCount: number, target = PDF_SAMPLE_PAGE_TARGET): number[] {
++  const total = Math.max(1, Math.min(pageCount, target));
++  if (total >= pageCount) {
++    return Array.from({ length: pageCount }, (_, i) => i + 1);
++  }
++  const pages = new Set<number>();
++  pages.add(1);
++  pages.add(pageCount);
++  for (let i = 0; pages.size < total; i += 1) {
++    const ratio = (i + 1) / (total + 1);
++    const page = Math.max(1, Math.min(pageCount, Math.round(pageCount * ratio)));
++    pages.add(page);
++  }
++  return Array.from(pages).sort((a, b) => a - b);
++}
++
++async function extractPdfPageText(doc: any, pageNum: number): Promise<string> {
++  const page = await doc.getPage(pageNum);
++  const content = await page.getTextContent();
++  let buffer = "";
++  for (const item of content.items as any[]) {
++    const str = typeof item?.str === "string" ? item.str : "";
++    if (!str) continue;
++    buffer += str;
++    buffer += item?.hasEOL ? "\n" : " ";
++  }
++  try {
++    await page.cleanup?.();
++  } catch {}
++  return normalizePlainText(buffer);
++}
++
++async function extractEmbeddedPagesFromPdf(
++  pdfBytes: Uint8Array,
++  opts: { sampleOnly?: boolean; allowEarlyStop?: boolean; maxPages?: number; sampleCount?: number } = {},
++): Promise<{ pages: PageText[]; pageCount: number; sampleTextLength: number; sampledPagesWithText: number; scanned: boolean }> {
++  if (!PDFJS_AVAILABLE) {
++    console.warn("PDF.js unavailable; skipping embedded text extraction.");
++    return { pages: [], pageCount: 0, sampleTextLength: 0, sampledPagesWithText: 0, scanned: true };
++  }
+   const task = pdfjs.getDocument({
+     data: pdfBytes,
+     disableWorker: true,
+   });
+   const doc = await task.promise;
++  const pageCount = doc?.numPages || 0;
++  if (!pageCount) {
++    return { pages: [], pageCount: 0, sampleTextLength: 0, sampledPagesWithText: 0, scanned: true };
++  }
++  const maxPages = Math.max(1, Math.min(opts.maxPages ?? MAX_EXTRACT_PAGES, pageCount || MAX_EXTRACT_PAGES));
++  const samplePages = buildSamplePageNumbers(pageCount, opts.sampleCount ?? PDF_SAMPLE_PAGE_TARGET);
++  const seen = new Set<number>();
++  const pages: PageText[] = [];
++  let sampleTextLength = 0;
++  let sampledPagesWithText = 0;
+ 
+   try {
+-    const pages: string[] = [];
+-    for (let pageNum = 1; pageNum <= doc.numPages; pageNum += 1) {
+-      const page = await doc.getPage(pageNum);
+-      const content = await page.getTextContent();
+-      let buffer = "";
+-      for (const item of content.items as any[]) {
+-        const str = typeof item?.str === "string" ? item.str : "";
+-        if (!str) continue;
+-        buffer += str;
+-        buffer += item?.hasEOL ? "\n" : " ";
++    for (const pageNum of samplePages) {
++      const normalized = await extractPdfPageText(doc, pageNum);
++      if (normalized) {
++        pages.push({ pageIndex: pageNum - 1, text: normalized });
++        sampleTextLength += normalized.length;
++        sampledPagesWithText += 1;
+       }
+-      const normalized = normalizeExtractedText(buffer);
++      seen.add(pageNum);
++    }
++
++    const treatAsEmbedded = sampleTextLength >= MIN_EMBEDDED_PDF_CHARS || sampledPagesWithText >= 3;
++    if (opts.sampleOnly || (!treatAsEmbedded && opts.allowEarlyStop !== false)) {
++      return { pages, pageCount, sampleTextLength, sampledPagesWithText, scanned: !treatAsEmbedded };
++    }
++
++    for (let pageNum = 1; pageNum <= maxPages; pageNum += 1) {
++      if (seen.has(pageNum)) continue;
++      const normalized = await extractPdfPageText(doc, pageNum);
+       if (normalized) {
+-        pages.push(`[Page ${pageNum}]\n${normalized}`);
++        pages.push({ pageIndex: pageNum - 1, text: normalized });
+       }
+     }
+-    return pages.join("\n\n").trim();
++    pages.sort((a, b) => a.pageIndex - b.pageIndex);
++
++    return { pages, pageCount, sampleTextLength, sampledPagesWithText, scanned: false };
+   } finally {
+     try {
+       await doc.cleanup?.();
+@@ -2274,6 +3454,12 @@ async function extractEmbeddedTextFromPdf(pdfBytes: Uint8Array): Promise<string>
+   }
+ }
+ 
++async function extractEmbeddedTextFromPdf(pdfBytes: Uint8Array): Promise<string> {
++  const result = await extractEmbeddedPagesFromPdf(pdfBytes, { allowEarlyStop: false, sampleCount: PDF_SAMPLE_PAGE_TARGET });
++  const normalized = normalizePages(result.pages);
++  return normalized.text;
++}
++
+ async function renderPdfPageToPngDataUrl(page: any): Promise<string> {
+   if (typeof OffscreenCanvas === "undefined") {
+     throw new Error("OffscreenCanvas is unavailable in this runtime; skipping PDF render OCR path.");
+@@ -2309,47 +3495,8 @@ async function renderPdfPageToPngDataUrl(page: any): Promise<string> {
+ }
+ 
+ async function ocrPdfBytesWithVision(env: Env, pdfBytes: Uint8Array, filename: string): Promise<string> {
+-  if (!PDFJS_AVAILABLE) throw new Error("pdfjs unavailable");
+-  const task = pdfjs.getDocument({
+-    data: pdfBytes,
+-    disableWorker: true,
+-  });
+-  const doc = await task.promise;
+-
+-  try {
+-    let combined = "[OCR]\n";
+-    const total = doc.numPages;
+-    const maxPages =
+-      typeof env.PDF_OCR_MAX_PAGES === "string" && Number.isFinite(Number(env.PDF_OCR_MAX_PAGES))
+-        ? Math.max(1, Number(env.PDF_OCR_MAX_PAGES))
+-        : DEFAULT_MAX_OCR_PAGES;
+-    const pageCap = Math.min(total, maxPages);
+-    console.log("[PDF] Starting OCR render", { filename, totalPages: total, pageCap });
+-    for (let start = 1; start <= pageCap; start += OCR_BATCH_IMAGE_COUNT) {
+-      const batch: Array<{ label: string; dataUrl: string }> = [];
+-      for (let pageNum = start; pageNum < start + OCR_BATCH_IMAGE_COUNT && pageNum <= pageCap; pageNum += 1) {
+-        const page = await doc.getPage(pageNum);
+-        const dataUrl = await renderPdfPageToPngDataUrl(page);
+-        batch.push({ label: `Page ${pageNum} OCR`, dataUrl });
+-      }
+-
+-      const extracted = await requestVisionOcrFromImages(env, batch, filename);
+-      if (extracted) {
+-        combined += extracted.trim() + "\n\n";
+-      }
+-
+-      if (combined.length >= MAX_OCR_TEXT_LENGTH) {
+-        combined = combined.slice(0, MAX_OCR_TEXT_LENGTH);
+-        break;
+-      }
+-    }
+-    return combined.trim();
+-  } finally {
+-    try {
+-      await doc.cleanup?.();
+-      await doc.destroy?.();
+-    } catch {}
+-  }
++  console.warn("[PDF] OCR render path is disabled in Worker runtime.");
++  return "";
+ }
+ 
+ async function requestVisionOcrFromImages(
+@@ -2894,7 +4041,8 @@ async function retryOpenAI(fn: (attempt: number) => Promise<Response>, label: st
+   let lastResp: Response | null = null;
+   for (let i = 0; i < RETRY_DELAYS_MS.length; i++) {
+     if (i > 0) {
+-      await delay(RETRY_DELAYS_MS[i]);
++      const delayMs = RETRY_DELAYS_MS[i] ?? 0;
++      await delay(delayMs);
+     }
+     const resp = await fn(i);
+     lastResp = resp;
